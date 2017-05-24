@@ -1,0 +1,970 @@
+#!/usr/bin/perl -w
+
+# hypertriplets_db
+
+use FindBin qw($Bin);
+use lib "$Bin/lib/perl5";
+use Data::Dumper;
+use Parallel::ForkManager;
+use Storable qw(dclone store);
+
+use Getopt::Long;
+use Pod::Usage;
+
+use Bio::TreeIO;
+use Bio::Tree::TreeFunctionsI;
+use Bio::Tree::TreeI;
+use Bio::Tree::NodeI;
+	
+use strict;
+
+# inputs
+
+$| = (@ARGV > 0); 
+
+# setup my defaults
+
+my $version;
+my $htVersion = "HyperTriplets 1.0";
+my $directory;
+my $help;
+my $man;
+my $outFile = "out.tab";
+my $delimiter;
+my $position;
+my $numThreads	= 1;
+
+GetOptions(
+    'treedir=s'=> \$directory,
+    'out=s'    => \$outFile,
+    'help!'     	=> \$help,
+	'version!'		=> \$version,
+	'man!'			=> \$man,
+	'delimiter=s'		=> \$delimiter,
+	'position=i'		=> \$position,
+	'numThreads=i'		=> \$numThreads,
+) or pod2usage(-verbose => 99, 
+            -sections => [ qw(NAME SYNOPSIS) ] );
+
+pod2usage(0) if $man;
+pod2usage(2) if $help;
+
+if ($version){
+	print $htVersion."\n";
+	exit;
+}
+
+if (!$directory){
+	print "ERROR: -treedir not provided.\n";
+	pod2usage(2);
+}
+
+####################
+
+#my $leavesLimit = 300;
+#my $treeLimit = 1000;
+#my $treeCount = 0;
+#my $outFileCount = 0;
+if ($directory =~ /\/$/){
+	chop $directory;
+}
+my $listFile = `find $directory/ -type f -name '*'`;
+
+my %hash_taxonomy;
+#open (TABLE, "< $taxTable") or die "\nERROR: Can't open the file $_\n";
+#while (my $line = <TABLE>){
+#	my $error2 = 0;
+#	chomp $line;
+#	next if ($line eq "");
+#	my @line = split(/\t/, $line);
+#	$hash_taxonomy{"code"}{$line[0]} = $line[1] if ($error2 == 0);
+#}
+#close TABLE;
+
+my @listFile = split(/\n/, $listFile);
+
+my %subjectInfo;
+my %generalInfo;
+my %genera3;
+my %map_txid;
+my %countSis2;
+my %meanDistance;
+my %countTotal;
+my %missingTxid;
+my $error = 0;
+
+my $pm = Parallel::ForkManager->new($numThreads, '/tmp/');
+
+#$hashRetrieved{$file}{$treecode}{$key1} = @sister;  
+#   	          |        |         |
+#       	      |        |         O--> sister list
+#           	  |        O--> reference
+#	              O--> file
+
+$pm -> run_on_finish ( # called BEFORE the first call to start()
+	sub {
+		my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data_structure_reference) = @_;
+		if ($data_structure_reference){
+			my %countSis_ref = %{$data_structure_reference};
+			if (exists $countSis_ref{"meanDistance"}){
+				my $ref_hash_confirm2 = $countSis_ref{"sister"};
+				my %hash_confirm2 = %$ref_hash_confirm2;
+				my $ref_meanDistance2 = $countSis_ref{"meanDistance"};
+				my %meanDistance2 = %$ref_meanDistance2;
+				my $ref_genera = $countSis_ref{"genera"};
+				my %genera = %$ref_genera;
+				
+				#my $countSis_ref2 = $countSis_ref{"tree"};
+				#print Dumper($countSis_ref2);
+				#$countSis2{$file} = $countSis_ref2;
+				
+				########
+				foreach my $groupid (keys %hash_confirm2){
+					my $sum = 0;
+					foreach my $groupid2 (keys %{$hash_confirm2{$groupid}}){
+						$sum += $hash_confirm2{$groupid}{$groupid2};
+					}
+					
+					foreach my $groupid2 (keys %{$hash_confirm2{$groupid}}){
+						$countSis2{$groupid}{$groupid2} += $hash_confirm2{$groupid}{$groupid2}/$sum;
+					}
+				}
+				
+				my @genera2 = keys %genera;
+				for (my $k = 0; $k < scalar(@genera2); $k++){
+					$genera3{$genera2[$k]} = 1;
+					for (my $l = $k+1; $l < scalar(@genera2); $l++){
+						if (exists $meanDistance2{$genera2[$k]}{$genera2[$l]}{"sum"}){
+							my $mean = $meanDistance2{$genera2[$k]}{$genera2[$l]}{"sum"}/$meanDistance2{$genera2[$k]}{$genera2[$l]}{"count"};
+							$meanDistance{$genera2[$k]}{$genera2[$l]}{"sum"} += $mean;
+							$meanDistance{$genera2[$k]}{$genera2[$l]}{"count"} += 1;
+							$meanDistance{$genera2[$k]}{$genera2[$l]}{"value"} .= $mean.";";
+							$meanDistance{$genera2[$l]}{$genera2[$k]}{"sum"} += $mean;
+							$meanDistance{$genera2[$l]}{$genera2[$k]}{"count"} += 1;
+							$meanDistance{$genera2[$l]}{$genera2[$k]}{"value"} .= $mean.";";
+						}
+						
+					}
+				}
+				########
+				
+				#$treeCount += scalar(keys %{$countSis_ref{"tree"}});
+				#if ($treeCount > $treeLimit){
+				#	print "Storing part $outFileCount\n";
+				#	store \%countSis2, $outFile.".".$outFileCount;
+				#	$outFileCount++;
+				#	undef %countSis2;
+				#	$treeCount = 0;
+				#}
+			}
+		}
+	}
+);
+
+my $count = 0;
+
+foreach my $file (@listFile){
+	print $file." ".$count."\n";
+	$count++;
+	$pm->start() and next;
+	my $treeFile = $file;
+	
+	my $input = new Bio::TreeIO(-file   => $treeFile,
+								-format => "newick");
+	my $tree = $input -> next_tree;
+	
+	my ($refTax, $refTree2) = identifyTaxonomy($tree);
+	#print "taxonomy over\n";
+	#$countSis2{$file}{"taxonomy"} = $refTax;
+	my %tax = %$refTax;
+	my %hash_result;
+	my %hash_result2;
+	$hash_result{"file"} = $file;
+	
+	if (scalar(keys %{$tax{"txid"}}) > 2){
+	
+		my $refTree = removeDup($refTree2, $refTax);
+		my $treeCount = 0;
+		
+		#foreach my $splittedTree (@arrayTree){
+			#$output->write_tree($splittedTree);
+			#my $refTax2 = identifyTaxonomy($splittedTree);
+			my ($refDupNodes, $refHashTree) = &identifyDupNodes($refTree, $refTax);
+			my $refCountSis = &pickTriplet($refTree, $refDupNodes, $refHashTree);
+			#print "pick triplet over\n";
+			my %countSis = %$refCountSis;
+			#print Dumper($refCountSis);
+			#if (scalar(keys %countSis) < 3){
+			#	next;
+			#} else {
+				$hash_result{"tree"}{"tree".$treeCount}{"sister"} = $refCountSis;
+				my $refDist = &pickDist($refTree, $refTax, $refDupNodes);
+				$hash_result{"tree"}{"tree".$treeCount}{"distance"} = $refDist;
+				$treeCount++;
+			#}
+			
+		#}
+		
+		###############
+		
+		my %hash_confirm2;
+		my %meanDistance2;
+		my %genera;
+		foreach my $tree(keys %{$hash_result{"tree"}}){
+		
+			# count sister
+			my %hash_species;
+			my %hash_confirm;
+			undef %hash_confirm;
+			#my @allSpecies = keys %{$hashRetrieved{$file}{$tree}{"sister"}};
+			#%hash_species = map { $_ => 1 } @allSpecies;
+			my $ref_sister = $hash_result{"tree"}{$tree}{"sister"};
+			my %hash_sister = %$ref_sister; 
+			foreach my $id (keys %hash_sister){
+				foreach my $id2(keys %{$hash_sister{$id}}){
+					if (exists $hash_confirm{$id2}){
+							next;
+					} else {
+						$hash_confirm{$id2} = 1;
+						$hash_confirm2{$id}{$id2} += 1;
+					}
+				}
+			}
+			
+			# count distance
+			my @distances = @{$hash_result{"tree"}{$tree}{"distance"}{"matrix"}};
+			my @genera = @{$hash_result{"tree"}{$tree}{"distance"}{"leaf"}};
+			
+			for(my $i = 0; $i < scalar @genera; $i++){
+				$genera{$genera[$i]} = 1;
+				for(my $j = $i + 1; $j < scalar @genera; $j++){
+					next if (!$distances[$i][$j]);
+					my $distance = $distances[$i][$j];
+					$meanDistance2{$genera[$i]}{$genera[$j]}{"sum"} += $distance;
+					$meanDistance2{$genera[$i]}{$genera[$j]}{"count"} += 1;
+					$meanDistance2{$genera[$j]}{$genera[$i]}{"sum"} += $distance;
+					$meanDistance2{$genera[$j]}{$genera[$i]}{"count"} += 1;
+				}
+			}
+			
+		}
+		$hash_result2{"meanDistance"} = \%meanDistance2;
+		$hash_result2{"sister"} = \%hash_confirm2;
+		$hash_result2{"genera"} = \%genera;
+		################
+	}
+	
+	#my $refCountSis = &formatTree($treeFile);
+
+	#$pm->finish(0, \%hash_result);
+	$pm->finish(0, \%hash_result2);
+}
+
+$pm->wait_all_children;
+
+# store
+#store \%countSis2, $outFile.".".$outFileCount;
+
+open (OUT, "> $outFile") or die;
+
+# print sister table
+print OUT "#spA,spB,spC\tspA|spB,spC\tspB|spA,spC\tspC|spA,spB\n";
+foreach my $id (sort keys %countSis2){
+	my @ids = split(",", $id);
+	print OUT $id;
+	for (my $i = 0; $i < 3; $i++){
+		my @ids2 = @ids;
+		my $ancestor = $ids2[$i];
+		splice @ids2, $i, 1;
+		push(@ids2, $ancestor);
+		my $id2 = join(",", @ids2);
+		
+		if (exists $countSis2{$id}{$id2}){
+			print OUT "\t".$countSis2{$id}{$id2};
+		} else {
+			print OUT "\t0";
+		}
+	}
+	print OUT "\n";
+}
+
+# print distance table
+
+print OUT "\n# sp1\tsp2\tmean\tsum\tcount\tmedian\tstd\n";
+my @genera3 = sort keys %genera3;
+for(my $i = 0; $i < scalar @genera3; $i++){
+	for(my $j = $i + 1; $j < scalar @genera3; $j++){
+		my $mean;
+		my $median;
+		if (!exists $meanDistance{$genera3[$i]}{$genera3[$j]}{"count"}){
+			print "NOTE: There is no tree with ".$genera3[$i]." and ".$genera3[$j].".\n";
+			print "      One of these samples should be discarded when using hypertriplets_analyse.\n";
+			#$mean = 0;
+			#$median = 0;
+		} else {
+			$mean = $meanDistance{$genera3[$i]}{$genera3[$j]}{"sum"}/$meanDistance{$genera3[$i]}{$genera3[$j]}{"count"};
+			my $values = $meanDistance{$genera3[$j]}{$genera3[$i]}{"value"};
+			chop $values;
+			my @values = split(";", $values); 
+			@values = sort { $a <=> $b } @values;
+			my $n = scalar @values;
+			if ($n % 2) { 
+				$median = $values[$n/2]; 
+			} else { 
+				$median = ($values[$n/2] + $values[$n/2 - 1]) / 2; 
+			}
+			my $sumdiffsquare = 0;
+			for(my $i = 0; $i < scalar @values; $i++){
+				$sumdiffsquare += ($values[$i] - $mean)**2;
+			}
+			my $variance = $sumdiffsquare/(scalar @values);
+			my $std = $variance**0.5;
+			print OUT $genera3[$i]."\t".$genera3[$j]."\t".$mean."\t".$meanDistance{$genera3[$i]}{$genera3[$j]}{"sum"}."\t".$meanDistance{$genera3[$i]}{$genera3[$j]}{"count"}."\t".$median."\t".$std."\n";
+			print OUT $genera3[$j]."\t".$genera3[$i]."\t".$mean."\t".$meanDistance{$genera3[$j]}{$genera3[$i]}{"sum"}."\t".$meanDistance{$genera3[$j]}{$genera3[$i]}{"count"}."\t".$median."\t".$std."\n";
+		}
+	}
+}
+
+print "\nThe file $outFile was generated.\n";
+print "Execute the command \"./hypertriplets_analyse -table $outFile\" to generate the supertree.\n";
+print "All Done!\n\n";
+
+####################### Subroutine #######################
+
+sub pickDist {
+
+	my $tree = $_[0];
+	my $refTax = $_[1];
+	my $refDupNodes = $_[2];
+	
+	my %leafTaxonomy = %$refTax;
+	my %dupNodes = %$refDupNodes;
+	
+	my @leaves2 = $tree -> get_leaf_nodes();
+	my @nodes2analyse;
+	my %leavesMap;
+	my %taxMap;
+	my $count = 0;
+
+	my %hash_tree;
+	my %hash_leaves;
+	my @genus;
+	my @pairTable;
+	my %pairTable;
+	foreach my $leaf (@leaves2){
+		my $genus = $leaf -> id;	
+		my $tax = $leafTaxonomy{"code"}{$genus}{"txid"};	
+		if (!exists $taxMap{$tax}){
+			push(@genus, $tax);
+			$taxMap{$tax} = $count;
+			$leavesMap{$genus} = $count;
+			$count++;
+		} else {
+			$leavesMap{$genus} = $taxMap{$tax};
+		}
+		
+		
+		my $ancestor = $leaf -> ancestor;
+		$hash_tree{$ancestor}{"descendent"} += 1;
+		$hash_tree{$ancestor}{"tax"}{$tax} = 1;
+		my @descendent = $ancestor -> each_Descendent;
+		my %taxControl;
+		my $length = $tree->distance(-nodes=>[$leaf, $ancestor]);
+		my @length = ($length);
+		$hash_leaves{$genus} = \@length;
+		if ($hash_tree{$ancestor}{"descendent"} > 1 && !exists $dupNodes{$ancestor}){
+			foreach my $leaf2(keys %{$hash_tree{$ancestor}{"leaf"}}){
+				my @leaf2Length = @{$hash_leaves{$leaf2}};
+				my $sumLength =	$leaf2Length[0] + $length;
+				my @codeSet;
+				push(@codeSet,$leavesMap{$leaf2});
+				push(@codeSet,$leavesMap{$genus});
+				@codeSet = sort { $a <=> $b } @codeSet;
+				$pairTable{$codeSet[0]}{$codeSet[1]}{"count"} += 1;
+				$pairTable{$codeSet[0]}{$codeSet[1]}{"sumLength"} += $sumLength;
+				$pairTable[$codeSet[0]][$codeSet[1]] = $pairTable{$codeSet[0]}{$codeSet[1]}{"sumLength"}/$pairTable{$codeSet[0]}{$codeSet[1]}{"count"};
+			}
+		}
+		
+		$hash_tree{$ancestor}{"leaf"}{$genus} = 1;
+		if (scalar @descendent == $hash_tree{$ancestor}{"descendent"}){
+			push(@nodes2analyse, $ancestor);
+		}
+	}
+	
+	my $rootNode = $tree->get_root_node();
+	
+	while (scalar @nodes2analyse > 0){
+		my $node = shift @nodes2analyse;
+		next if ($node eq $rootNode);
+		my $ancestor = $node -> ancestor;
+		$hash_tree{$ancestor}{"descendent"} += 1;
+		my @descendent = $ancestor -> each_Descendent;
+		my $length = $tree->distance(-nodes=>[$node, $ancestor]);
+		my @currentLeaves;
+		if($hash_tree{$ancestor}{"descendent"} > 1){
+			@currentLeaves = keys %{$hash_tree{$ancestor}{"leaf"}};
+		}
+		foreach my $leaf(keys %{$hash_tree{$node}{"leaf"}}){
+			#print $leaf."\n";
+			$hash_tree{$ancestor}{"leaf"}{$leaf} = $hash_tree{$node}{"leaf"}{$leaf} + 1;
+			my @length = @{$hash_leaves{$leaf}};
+			my $lastLengthId = scalar @length - 1;
+			my $currentNodeLength = $length[$lastLengthId] + $length;
+			push(@length, $currentNodeLength);
+			$hash_leaves{$leaf} = \@length;
+			
+			if ($hash_tree{$ancestor}{"descendent"} > 1 && !exists $dupNodes{$ancestor}){
+				foreach my $leaf2(@currentLeaves){
+					my @leaf2Length = @{$hash_leaves{$leaf2}};
+					my $sumLength =	$leaf2Length[$hash_tree{$ancestor}{"leaf"}{$leaf2}-1] + $length[$lastLengthId + 1];
+					my @codeSet;
+					push(@codeSet,$leavesMap{$leaf2});
+					push(@codeSet,$leavesMap{$leaf});
+					@codeSet = sort { $a <=> $b } @codeSet;
+					$pairTable{$codeSet[0]}{$codeSet[1]}{"count"} += 1;
+					$pairTable{$codeSet[0]}{$codeSet[1]}{"sumLength"} += $sumLength;
+					$pairTable[$codeSet[0]][$codeSet[1]] = $pairTable{$codeSet[0]}{$codeSet[1]}{"sumLength"}/$pairTable{$codeSet[0]}{$codeSet[1]}{"count"};
+				}
+			}
+		}
+		if (scalar @descendent == $hash_tree{$ancestor}{"descendent"}){
+			push(@nodes2analyse, $ancestor);
+		}
+	}
+	
+	#$generalResult{$file}{"leaf"} = \@genus;			
+	#$generalResult{$file}{"matrix"} = \@pairTable;			
+	#$generalResult{$file}{"taxonomy"} = \%leafTaxonomy;	
+	my %forkResult = (
+		#"file" => $file,
+		"leaf" => \@genus,
+		"matrix" => \@pairTable,
+		#"taxonomy" => \%leafTaxonomy,
+	);
+	
+	return \%forkResult;
+}
+
+sub identifyTaxonomy {
+
+	my $tree = $_[0];
+	my $tree5 = $tree -> clone();
+	my @leaves2 = $tree5 -> get_leaf_nodes();
+	my %leafTaxonomy;
+	
+	#if (scalar @leaves2 > $leavesLimit){
+	#	return \%leafTaxonomy;
+	#}
+	
+	my %dupControl;
+	foreach my $leaf (@leaves2){
+		my $genus = $leaf -> id;		
+		my $genusDef = $genus;
+		my $leafTxid;
+		if (exists $dupControl{$genus}){
+			$dupControl{$genus} += 1;
+			my $count = $dupControl{$genus};
+			$leaf -> id($genus."_dup".$count);
+			$genusDef = $genus."_dup".$count;
+		} else {
+			$dupControl{$genus} = 1;
+		}
+		
+		# identify taxonomy
+		if ($delimiter && $position =~ (/^\d+$/)){
+			my $delimiter2 = quotemeta($delimiter);
+			my @tags = split(/$delimiter2/, $genus);
+			$leafTxid = $tags[$position];
+			#if (!exists $hash_taxonomy{"code"}{$leafTxid}){
+			#	die "ERROR: Problem with leaf $genus during taxonomy extraction.\n       Code extracted: $leafTxid.\n";
+			#} else {
+				#$leafTaxonomy{"txid"}{$hash_taxonomy{"code"}{$leafTxid}}{$leafTxid} += 1;
+			#}
+		} else {
+			$leafTxid = $genus;
+			#if (!exists $hash_taxonomy{"code"}{$genus}){
+			#	die "ERROR: Problem with leaf $genus during taxonomy extraction.\n       Code extracted: $genus.\n";
+			#} else {
+				#$leafTaxonomy{"txid"}{$hash_taxonomy{"code"}{$genus}}{$genus} += 1;
+		#		$leafTaxonomy{"txid"}{$genus}{$genus} += 1;
+		#		$leafTaxonomy{"code"}{$genus}{"txid"} = $genus;
+			#}
+		}
+		$leafTaxonomy{"txid"}{$leafTxid}{$genusDef} += 1;
+		$leafTaxonomy{"code"}{$genusDef}{"txid"} = $leafTxid;
+	}
+	return (\%leafTaxonomy, $tree5);
+}		
+
+sub removeDup {
+	my $tree = $_[0];
+	my $refTax = $_[1];
+	
+	my %tax = %$refTax;
+	
+	my @txidList = keys %{$tax{"txid"}};
+	my @codeList = keys %{$tax{"code"}};
+	# my @trees;
+	my $tree5 = $tree -> clone();
+	
+	if (scalar @txidList == scalar @codeList){
+		#push (@trees, $tree5);
+		return $tree;
+	}
+	
+#	my $root = $tree5-> get_root_node();
+#	my $rootid = $root -> internal_id;
+	
+	my @leaves2 = $tree5 -> get_leaf_nodes();
+	
+	##########
+	# delete recent duplications
+	
+	my @lcaNode;
+	my %leaf2remove;
+	my @leaf2remove;
+	my %lcaLength;
+	my $dup = 0;
+	
+	foreach my $leaf(@leaves2){
+		my $leafID = $leaf -> id;
+		next if (exists $leaf2remove{$leafID});
+		#print $leafID.";";
+		my $leafTax = $tax{"code"}{$leafID}{"txid"};
+		next if (scalar(keys %{$tax{"txid"}{$leafTax}}) == 1);
+		#print $leafID.";";
+		my %nodeAnalysed;
+		my $currentNode = $leaf;
+		$nodeAnalysed{$currentNode} = 1;
+		
+		#my $nodeCount = 0;
+		my %sister;
+		$sister{$leafTax}{$leafID} = 1;
+		my $prevNode = $currentNode;
+		my @sisterSpecies;
+		while(scalar(keys %sister) < 2){
+			@sisterSpecies = keys %{$sister{$leafTax}};
+			if ( eval {$currentNode -> ancestor}){
+				my $ancestor = $currentNode -> ancestor;
+				my @descendents = $ancestor -> each_Descendent;
+				foreach my $ancDescendent(@descendents){
+					next if (exists $nodeAnalysed{$ancDescendent});
+					if ($ancDescendent -> is_Leaf){
+						#next if ($ancDescendent eq $leaf);
+						my $leafID2 = $ancDescendent -> id;
+						my $leafTax2 = $tax{"code"}{$leafID2}{"txid"};
+						#next if ($leafTax2 eq $leafTax);
+						$sister{$leafTax2}{$leafID2} = 1;
+					} else {
+						my @descendents2 = $ancDescendent -> get_all_Descendents;
+						foreach my $ancDescendent2(@descendents2){
+							if ($ancDescendent2 -> is_Leaf){
+								#next if ($ancDescendent eq $leaf);
+								my $leafID2 = $ancDescendent2 -> id;
+								my $leafTax2 = $tax{"code"}{$leafID2}{"txid"};
+								#next if ($leafTax2 eq $leafTax);
+								$sister{$leafTax2}{$leafID2} = 1;
+							}
+						}
+					}
+					
+					 
+				}
+				$prevNode = $currentNode;
+				$currentNode = $ancestor;
+			} else {
+				last;
+			}
+			$nodeAnalysed{$currentNode} = 1;
+		}
+		#if (scalar(keys %sister) > 1){
+			#my @sister = sort keys %sister;
+			if (scalar @sisterSpecies > 1){
+				# there is a recent duplication
+				#if ($prevNode -> is_Leaf){
+				#	$prevNode = $prevNode -> ancestor;
+				#	@sisterSpecies = keys %{$sister{$leafTax}};
+				#}
+				#print "here\n";
+				foreach my $leaf2(@sisterSpecies){
+					$leaf2remove{$leaf2} = 1;
+				}
+				#push(@lcaNode, $prevNode);
+				$dup = 1;
+				my @lcaDesc = $prevNode -> get_all_Descendents;
+				my @leaves;
+				my $leafLength = 0;
+				for (my $i = 0; $i < scalar @lcaDesc; $i++){
+					if ($lcaDesc[$i] -> is_Leaf){
+						push (@leaves, $lcaDesc[$i]);
+						my $length = $tree5 -> distance(-nodes=>[$lcaDesc[$i], $prevNode]);
+						$leafLength += $length;
+					} 
+				}
+				my $meanLength = $leafLength/(scalar @leaves);
+				my $node2analyse = $prevNode;
+				
+				my $isLeaf = 0;
+				while(!$isLeaf){
+					my @lcaEachDesc = $node2analyse -> each_Descendent;
+					for (my $j = 1; $j < scalar @lcaEachDesc; $j++){
+						$tree5 -> remove_Node($lcaEachDesc[$j]);
+					}
+					if ($lcaEachDesc[0] -> is_Leaf){
+						$isLeaf = 1;
+						$lcaLength{$prevNode}{"leaf"} = $lcaEachDesc[0];
+						$lcaLength{$prevNode}{"length"} = $meanLength;
+					} else {
+						$node2analyse = $lcaEachDesc[0];
+					}
+				}
+			} 
+		#}
+	}
+	
+	if ($dup){
+
+		$tree5 -> contract_linear_paths();
+		
+		foreach my $lcaNode(keys %lcaLength){
+			my $leaf = $lcaLength{$lcaNode}{"leaf"};
+			my $length = $lcaLength{$lcaNode}{"length"};
+			$leaf-> branch_length($length);
+		}	
+	}
+
+	#my %lcaLength;
+	#if (scalar @lcaNode > 0){
+	#	foreach my $lcaNode(@lcaNode){
+	#		my @lcaDesc = $lcaNode -> get_all_Descendents;
+	#		my @leaves;
+	#		my $leafLength = 0;
+	#		for (my $i = 0; $i < scalar @lcaDesc; $i++){
+	#			if ($lcaDesc[$i] -> is_Leaf){
+	#				push (@leaves, $lcaDesc[$i]);
+	#				my $length = $tree5 -> distance(-nodes=>[$lcaDesc[$i], $lcaNode]);
+	#				$leafLength += $length;
+	#			} 
+	#		}
+	#		my $meanLength = $leafLength/(scalar @leaves);
+	#		my $node2analyse = $lcaNode;
+	#		
+	#		my $isLeaf = 0;
+	#		while(!$isLeaf){
+	#			my @lcaEachDesc = $node2analyse -> each_Descendent;
+	#			for (my $j = 1; $j < scalar @lcaEachDesc; $j++){
+	#				$tree5 -> remove_Node($lcaEachDesc[$j]);
+	#			}
+	#			if ($lcaEachDesc[0] -> is_Leaf){
+	#				$isLeaf = 1;
+	#				$lcaLength{$lcaNode}{"leaf"} = $lcaEachDesc[0];
+	#				$lcaLength{$lcaNode}{"length"} = $meanLength;
+	#			} else {
+	#				$node2analyse = $lcaEachDesc[0];
+	#			}
+	#		}
+	#		
+	#	}
+		
+	#	$tree5 -> contract_linear_paths();
+	#	
+	#	foreach my $lcaNode(keys %lcaLength){
+	#		my $leaf = $lcaLength{$lcaNode}{"leaf"};
+	#		my $length = $lcaLength{$lcaNode}{"length"};
+	#		$leaf ->branch_length($length);
+	#	}
+	#}
+	
+	#return $tree5, \%tax;
+	return $tree5;
+
+}
+
+sub identifyDupNodes {
+
+	my $tree = $_[0];
+	my $refTax = $_[1];
+	my %tax = %$refTax;
+	
+	my $root = $tree-> get_root_node();
+	my @descendent_root = $root->each_Descendent;
+	my %dupNodes;
+
+	#if (scalar @txidList != scalar @codeList){
+	#print "annotating each internal node.\n";
+	# annotate each internal node if it is a duplication node
+	my @nodes2analyse;
+
+	my @descendentAllNodes2 = $root -> get_all_Descendents;
+	my %hash_descendent_node;
+	my %hash_all_leaves;
+	my %hash_tree;
+	
+	foreach my $descendent2(@descendentAllNodes2){
+		if ($descendent2 -> is_Leaf()){
+			my $leafID2 = $descendent2 -> id();
+			my $leafTax2 = $tax{"code"}{$leafID2}{"txid"};
+			$hash_all_leaves{$leafTax2} = 1;
+			$hash_tree{$root}{"txid"}{$tax{"code"}{$leafID2}{"txid"}} = 1;
+			$hash_tree{$root}{"code"}{$leafID2} = 1;
+			$hash_tree{$root}{"count"} += 1;
+		} else {
+			next;
+		}
+	}
+		
+	$hash_descendent_node{$root} = \%hash_all_leaves;
+	push (@nodes2analyse, $root);
+		
+	while (scalar @nodes2analyse != 0){
+		my $node = shift @nodes2analyse;
+		
+		my $ref_hash_all_leaves = dclone(\%{$hash_tree{$node}});
+		my %parentLeaves = %$ref_hash_all_leaves;			
+		
+		######
+		# verify if it is a duplication node
+		
+		my @descendentNodes2 = $node->each_Descendent;
+		#my @descendentIds;
+		my $branchCount = 0;
+		my %taxCountControl;
+		my $dup = 0;
+		my %leafIDCount;
+		my %orderDescendentNode;
+		my $order = 0;
+		
+		foreach my $descendentNodes2(@descendentNodes2){
+			my $count = $descendentNodes2->descendent_count;
+			#print $count."**\n";
+			$orderDescendentNode{$order} = $count;
+			$order++;
+		}
+		my @orderDescendentNode = sort { $orderDescendentNode{$a} <=> $orderDescendentNode{$b} } keys %orderDescendentNode;
+		
+		for (my $n = 0; $n < scalar @orderDescendentNode - 1; $n++){
+			my $descendentNodes2 = @descendentNodes2[$orderDescendentNode[$n]];
+			if ($descendentNodes2 -> is_Leaf()){
+				my $leafid = $descendentNodes2 -> id;
+				$leafIDCount{$branchCount}{$leafid} = 1;
+				
+				#push(@descendentIds, $leafid);
+				$hash_tree{$descendentNodes2}{"txid"}{$tax{"code"}{$leafid}{"txid"}} = 1;
+				$hash_tree{$descendentNodes2}{"code"}{$leafid} = 1;
+				$hash_tree{$descendentNodes2}{"count"} += 1;
+				if (!exists $taxCountControl{$tax{"code"}{$leafid}{"txid"}}){
+					$taxCountControl{$tax{"code"}{$leafid}{"txid"}} = $branchCount;
+				} else {
+					$dup = 1 if ($taxCountControl{$tax{"code"}{$leafid}{"txid"}} != $branchCount);
+				}
+				
+				delete $parentLeaves{"code"}{$leafid};
+				
+			} else {
+				push(@nodes2analyse, $descendentNodes2);
+				my @descendents = $descendentNodes2 -> get_all_Descendents;
+				#my $descendentId = $descendentNodes2 -> internal_id;
+				#push(@descendentIds, $descendentId);
+				my $paralog = 0;
+				foreach my $descendent(@descendents){
+					if ($descendent -> is_Leaf()){
+						my $leafid = $descendent -> id;
+						$hash_tree{$descendentNodes2}{"txid"}{$tax{"code"}{$leafid}{"txid"}} += 1;
+						$hash_tree{$descendentNodes2}{"code"}{$leafid} = 1;
+						$hash_tree{$descendentNodes2}{"count"} += 1;
+						#$paralog = 1 if ($hash_tree{$descendentNodes2}{"txid"}{$tax{"code"}{$leafid}{"txid"}} > 1);
+						if (!exists $taxCountControl{$tax{"code"}{$leafid}{"txid"}}){
+							$taxCountControl{$tax{"code"}{$leafid}{"txid"}} = $branchCount;
+						} else {
+							$dup = 1 if ($taxCountControl{$tax{"code"}{$leafid}{"txid"}} != $branchCount);
+							#last if ($dup);
+						}
+						delete $parentLeaves{"code"}{$leafid};
+					} else {
+						next;
+					}	
+				}
+				
+			}
+			$branchCount++;
+		}
+		#print scalar(@orderDescendentNode)."*@*\n";
+		my $leftNode = $descendentNodes2[$orderDescendentNode[scalar @orderDescendentNode - 1]];
+		if (scalar keys %{$parentLeaves{"code"}} > 1){
+			push(@nodes2analyse, $leftNode);
+		}
+		foreach my $leafLeft (keys %{$parentLeaves{"code"}}){
+			$hash_tree{$leftNode}{"txid"}{$tax{"code"}{$leafLeft}{"txid"}} += 1;
+			$hash_tree{$leftNode}{"code"}{$leafLeft} = 1;
+			$hash_tree{$leftNode}{"count"} += 1;
+			if (!exists $taxCountControl{$tax{"code"}{$leafLeft}{"txid"}}){
+				$taxCountControl{$tax{"code"}{$leafLeft}{"txid"}} = $branchCount;
+			} else {
+				$dup = 1 if ($taxCountControl{$tax{"code"}{$leafLeft}{"txid"}} != $branchCount);
+			}
+		}
+		
+		if ($dup){
+			$dupNodes{$node} = 1;
+		}
+	}
+	
+	return(\%dupNodes, \%hash_tree);
+}
+
+sub pickTriplet{
+
+	my $tree = $_[0];
+	my $refDupNodes = $_[1];
+	my $refHashTree = $_[2];
+	
+	my %dupNodes = %$refDupNodes;
+	my %hash_tree = %$refHashTree;
+	my %countSis;
+	
+	my @leaves2 = $tree -> get_leaf_nodes();
+	
+	my $root = $tree-> get_root_node();
+
+	#####
+	# pick triplets
+	
+	my @nodes2analyse2;
+	
+	push (@nodes2analyse2, $root);
+	
+	while (scalar @nodes2analyse2 != 0){
+	
+		my $node = shift @nodes2analyse2;
+		
+		my @descendentNodes2 = $node->each_Descendent;
+		
+		foreach my $descendentNodes2(@descendentNodes2){
+			push(@nodes2analyse2, $descendentNodes2);
+		}
+		next if (exists $dupNodes{$node});
+	
+		for (my $o = 0; $o < scalar @descendentNodes2; $o++){
+			
+			my @nodes2analyse3;
+			# verify if descendent have a sister group
+			next if ($descendentNodes2[$o] -> is_Leaf());
+			my @ancestorTax;
+			
+			for (my $r = 0; $r < scalar @descendentNodes2; $r++){
+				next if ($r == $o);
+				my @ancestor = keys %{$hash_tree{$descendentNodes2[$r]}{"txid"}};
+				push(@ancestorTax, @ancestor);
+			}
+			
+			push(@nodes2analyse3, $descendentNodes2[$o]);
+			my $count2 = 0;
+			while(scalar @nodes2analyse3 != 0){
+				$count2++;
+				#print $count2.";";
+				my $node2 = shift @nodes2analyse3;
+				if (exists $dupNodes{$node2}){
+					my @descendentNodes3 = $node2->each_Descendent;
+					foreach my $descendentNodes3(@descendentNodes3){
+						next if ($descendentNodes3 -> is_Leaf());
+						push(@nodes2analyse3, $descendentNodes3);
+					}
+				} else {
+				
+					my @sister = keys %{$hash_tree{$node2}{"txid"}};
+					#print scalar @sister."*\n";
+					for (my $p = 0; $p < scalar @sister; $p++){
+						next if ($sister[$p] eq "");
+						for (my $q = $p+1; $q < scalar @sister; $q++){
+							next if ($sister[$q] eq "");
+							my @order;
+							push(@order, $sister[$p]);
+							push(@order, $sister[$q]);
+							@order = sort @order;
+							
+							for(my $m = 0; $m < scalar @ancestorTax; $m++){
+								next if ($ancestorTax[$m] eq "");
+								my @order2 = @order;
+								push (@order2, $ancestorTax[$m]);
+								my $id2 = join(",", @order2);
+								@order2 = sort @order2;
+								my $id = join(",", @order2);
+								$countSis{$id}{$id2} += 1
+							}
+						}
+			
+					}
+				}
+			}
+		}
+	}
+	return (\%countSis);
+}
+
+=head1 NAME
+
+HyperTriplets - Supertree generator using triplets analysis
+
+=head1 SYNOPSIS
+
+./hypertriplet_db -treedir <tree_directory>
+
+=item B<Other parameters>:
+
+[-out file_name] [-position] [-delimiter] [-numThreads]
+		
+=item B<Help>:
+
+[-help] [-man] [-version]
+
+Use -man for a detailed help.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-treedir> <tree_directory>
+
+A path for a folder with the gene trees.
+
+=item B<-out> <file_name> Default: "out.tab"
+
+Output file name.
+
+=item B<-numThreads> Defalut: 1
+
+Number of processors to be used for programs that can handle multi-threading.
+
+=item B<-delimiter>
+
+A character delimiter. You can provide the character delimiter and the field position 
+if the taxonomic names provided in the table are delimited in the leaves of the gene 
+trees. Use this option along with -position.
+E.g. for leaf names with the following pattern: Phy000CXRS_YEAST, by choosing "_" as 
+delimiter and "1" as field position (0 is the first position), YEAST will be extracted 
+to be consulted in the taxonomic table.
+
+=item B<-position> Defalut: 1
+
+Field position. Use this option along with -delimiter. See -delimiter.
+
+=item B<-version>
+
+Print HyperTriplets version.
+
+=item B<-help>
+
+Print a brief help message and exits.
+
+=item B<-man>
+
+Prints the manual page and exits.
+
+=back
+
+=head1 DESCRIPTION
+
+B<HyperTriplets> is a phylogenetic tool that makes a supetree based on triplets analysis. It takes as input several gene trees in Newick format. 
+
+=cut

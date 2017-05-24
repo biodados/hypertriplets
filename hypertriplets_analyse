@@ -1,0 +1,897 @@
+#!/usr/bin/perl -w
+
+use strict;
+use FindBin qw($Bin);
+use lib "$Bin/lib/perl5";
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use Parallel::ForkManager;
+use Storable qw(dclone);
+
+# inputs
+
+$| = (@ARGV > 0); 
+
+# setup my defaults
+
+my $version;
+my $hypertripletsVersion = "HyperTriplets 1.0";
+my $tableFile;
+my $replicate = 100;
+my $taxtable;
+my $printTax;
+my $help;
+my $man;
+my $outfile = "out";
+my $numThreads	= 1;
+
+GetOptions(
+    'table=s'=> \$tableFile,
+    'tax=s'=> \$taxtable,
+    'out=s'    => \$outfile,
+    'printTax!'     	=> \$printTax,
+    'help!'     	=> \$help,
+	'version!'		=> \$version,
+	'man!'			=> \$man,
+	'numThreads=i'		=> \$numThreads,
+	'rep=i'		=> \$replicate,
+) or pod2usage(-verbose => 99, 
+            -sections => [ qw(NAME SYNOPSIS) ] );
+
+pod2usage(0) if $man;
+pod2usage(2) if $help;
+if ($version){
+	print $hypertripletsVersion."\n";
+	exit;
+}
+
+if (!$tableFile){
+	print "ERROR: -table not provided.\n";
+	pod2usage(2);
+}
+
+my $oldDelimiter = $/;
+$/ = "\n\n";
+open(TAB, "< $tableFile") or die;
+
+my @tabFile = <TAB>;
+my $tripletData = $tabFile[0];
+my $distanceData = $tabFile[1];
+
+my @tripletData = split(/\n/, $tripletData);
+my @distanceData = split(/\n/, $distanceData);
+$/ = $oldDelimiter;
+
+my %hash_table;
+my $maxFreq = 0;
+my $maxTax = "";
+for (my $i = 0; $i < scalar @tripletData; $i++){
+	my $line = $tripletData[$i];
+	next if ($line =~ /^#/);
+	chomp $line;
+	my @line = split(/\t/, $line);
+	my @species = split(",", $line[0]);
+	my $total = $line[1]+$line[2]+$line[3];
+	if ($total == 0){
+		$total = 1;
+	}
+	$hash_table{$species[0]}{$species[1]}{$species[2]} = $line[1]/$total;
+	$hash_table{$species[0]}{$species[2]}{$species[1]} = $line[1]/$total;
+	$hash_table{$species[1]}{$species[2]}{$species[0]} = $line[2]/$total;
+	$hash_table{$species[1]}{$species[0]}{$species[2]} = $line[2]/$total;
+	$hash_table{$species[2]}{$species[0]}{$species[1]} = $line[3]/$total;
+	$hash_table{$species[2]}{$species[1]}{$species[0]} = $line[3]/$total;
+}
+
+my %hash_distance;
+for (my $i = 0; $i < scalar @distanceData; $i++){
+	my $line = $distanceData[$i];
+	next if ($line =~ /^#/);
+	chomp $line;
+	my @line = split(/\t/, $line);
+	$hash_distance{$line[0]}{$line[1]} = $line[2];
+}
+
+close TAB;
+
+my @species = keys %hash_table;
+
+###########################
+
+if ($printTax){
+	print join("\n", @species)."\n";
+	exit;
+}
+
+###########################
+
+if ($taxtable){
+	open(TAX, "< $taxtable") or die;
+	undef @species;
+	while(my $line = <TAX>){
+		chomp $line;
+		if (!exists $hash_table{$line}){
+			die "ERROR: the table does not contain $line.\n";
+		}
+		push (@species, $line);
+	}
+	close TAX;
+}
+
+###########################
+
+
+my %hash_tree;
+my @nodes2analyse;
+
+my $maxScore = 0;
+my $countTree = 0;
+my $count4 = 0;
+my $count20 = 0;
+
+my $pm = Parallel::ForkManager->new($numThreads, '/tmp/');
+
+$pm -> run_on_finish ( # called BEFORE the first call to start()
+	sub {
+		my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data_structure_reference) = @_;
+		if ($data_structure_reference){
+			my %hash_def = %{$data_structure_reference};
+			my $score = $hash_def{"scoreMean"};
+			my $tree = $hash_def{"tree"};
+			if ($maxScore < $score){
+				$maxScore = $score;
+				$countTree = 0;
+				$count4 = 0;
+				$count20 = 0;
+				undef %hash_tree;
+				%hash_tree = %{ dclone $tree };
+				print " ]\nBetter tree found. Score: $maxScore\nSearching for an even better tree: [ ";
+			} else {
+				$countTree++;
+			}
+		}
+		
+		if ($countTree > ($replicate/20)*$count20){
+			$count20++;
+			if ($countTree > ($replicate/4)*$count4){
+				$count4++;
+				print $countTree;
+			} else {
+				print ".";
+			}
+		}
+	}
+);
+
+do {
+
+	while ($countTree < $replicate){
+
+		$pm->start() and next;
+		
+		my $sumMean = 0;
+		my $sumVariance = 0;
+		my $countAnalysed = 0;
+		
+		#my %tree_tmp = %{ dclone \%hash_tree };
+		fisher_yates_shuffle(\@species);
+		@nodes2analyse = @species;
+		my $ref_hash_tree = randomTree(\@species);
+		my %tree_tmp = %$ref_hash_tree;
+		
+		my $problematicNodes = 1;
+		my $prevNodeControl = -1;
+		my $prevNode = -1;
+		my $nodeControlCount = 0;
+		my %nodeControl2;
+		my @nodeControl2;
+			
+		while ($problematicNodes){
+
+			$problematicNodes = 0;
+			my %nodeControl;	
+			$sumMean = 0;
+			$countAnalysed = 0;	
+			
+			while (scalar @nodes2analyse > 0){
+				my $refNode = shift @nodes2analyse;
+				if ($tree_tmp{$refNode}{"parent"} ne "root"){
+					push (@nodes2analyse, $tree_tmp{$refNode}{"parent"}) if (!exists $nodeControl{$tree_tmp{$refNode}{"parent"}});
+					$nodeControl{$tree_tmp{$refNode}{"parent"}} = 1;
+				} else {
+					next;
+				}
+				next if (!exists $tree_tmp{$refNode}{"child"});
+				my $ancestor = $tree_tmp{$refNode}{"parent"};
+				
+				$countAnalysed++;
+				
+				if (exists $tree_tmp{$refNode}{"scoreMean"}){
+					if ($tree_tmp{$refNode}{"check"} == 0){
+						$sumMean += $tree_tmp{$refNode}{"scoreMean"};
+						next;
+					}
+				}
+				
+				#next if ($ancestor eq "root");
+				my @ancChild = @{$tree_tmp{$ancestor}{"child"}};
+				my $ancChild = "";
+				if ($ancChild[0] eq $refNode){
+					$ancChild = $ancChild[1];
+				} else {
+					$ancChild = $ancChild[0];
+				}
+				my $refAncLeaves = pickLeaves($ancChild, \%tree_tmp);
+				my @ancLeaves = @$refAncLeaves;
+				
+				my @child = @{$tree_tmp{$refNode}{"child"}};
+				#foreach my $child2(@child){
+				#	push (@nodes2analyse, $child2);
+				#}
+				my $refChildLeaves1 = pickLeaves($child[0], \%tree_tmp);
+				my $refChildLeaves2 = pickLeaves($child[1], \%tree_tmp);
+				my @childLeaves1 = @$refChildLeaves1;
+				my @childLeaves2 = @$refChildLeaves2;
+				#print Dumper(\@ancLeaves);
+				my ($result, $mean, $variance, $otherNode) = calculateScore(\@ancLeaves, \@childLeaves1, \@childLeaves2);
+				my @mean = @$mean;
+				$tree_tmp{$refNode}{"score"} = $otherNode;
+				$tree_tmp{$refNode}{"scoreMean"} = $mean[0];
+				$tree_tmp{$refNode}{"check"} = 0;
+				my @altMean = ($mean[1], $mean[2]);
+				my @repChild = ($childLeaves1[0], $childLeaves2[0]);
+				$tree_tmp{$refNode}{"altMean"} = \@altMean;
+				$tree_tmp{$refNode}{"repChild"} = \@repChild;
+				$sumMean += $mean[0];
+				
+				if ($otherNode != 0){
+					#print $refNode."/".$prevNode.",";
+					if ($refNode == $prevNode){
+						#$prevNode = -1;
+						next;
+					} else {
+						$prevNode = $refNode;
+					}
+					
+					push (@nodeControl2, $refNode);
+					$nodeControl2{$refNode} += 1;
+					if (scalar @nodeControl2 > 10){
+						my $minus = shift @nodeControl2;
+						if ($nodeControl2{$minus} == 1){
+							delete $nodeControl2{$minus};
+						} else {
+							$nodeControl2{$minus} -= 1;
+						}
+					}
+					my @nodeControlKeys = sort keys %nodeControl2;
+					my $nodeControlKeys = join(",", @nodeControlKeys);
+					
+					if ($nodeControlKeys eq $prevNodeControl){
+						$nodeControlCount++;
+					} else {
+						$nodeControlCount = 0;
+					}
+					if ($nodeControlCount > 10){
+						#print "*here*";
+						next;
+					}
+					$prevNodeControl = $nodeControlKeys;
+					
+					$tree_tmp{$refNode}{"scoreMean"} = $mean[$otherNode];
+					@altMean = ($mean[0], $mean[2/$otherNode]);
+					$tree_tmp{$refNode}{"altMean"} = \@altMean;
+					@repChild = ($ancLeaves[0], $repChild[2/$otherNode - 1]);
+					$tree_tmp{$refNode}{"repChild"} = \@repChild;
+					my $posSwitchChild = $tree_tmp{$refNode}{"score"} - 1;
+					my @child = @{$tree_tmp{$refNode}{"child"}};
+					my $switchChild;
+					$switchChild = shift @child if ($posSwitchChild == 0);
+					$switchChild = pop @child if ($posSwitchChild == 1);
+					
+					my $noSwitchChild = $child[0];
+					
+					my $parentNode = $tree_tmp{$refNode}{"parent"};
+					
+					my @parentAnc = @{$tree_tmp{$parentNode}{"child"}};
+					my $switchAnc;
+					if ($parentAnc[1] eq $refNode){
+						$switchAnc = shift @parentAnc;
+					} else {
+						$switchAnc = pop @parentAnc;
+					}
+					
+					push (@child, $switchAnc);
+					$tree_tmp{$refNode}{"child"} = \@child;
+					push (@parentAnc, $switchChild);
+					$tree_tmp{$parentNode}{"child"} = \@parentAnc;
+					
+					$tree_tmp{$switchChild}{"parent"} = $parentNode;			
+					$tree_tmp{$switchAnc}{"parent"} = $refNode;
+					
+					$tree_tmp{$parentNode}{"check"} = 1;
+					if (exists $tree_tmp{$switchChild}{"child"}){
+						my @checkChild = @{$tree_tmp{$switchChild}{"child"}};
+						$tree_tmp{$switchChild}{"check"} = 1 if (scalar @checkChild > 1);
+					}
+					if (exists $tree_tmp{$switchAnc}{"child"}){
+						my @checkChild = @{$tree_tmp{$switchAnc}{"child"}};
+						$tree_tmp{$switchAnc}{"check"} = 1 if (scalar @checkChild > 1);
+					}
+					if (exists $tree_tmp{$noSwitchChild}{"child"}){
+						my @checkChild = @{$tree_tmp{$noSwitchChild}{"child"}};
+						$tree_tmp{$noSwitchChild}{"check"} = 1 if (scalar @checkChild > 1);
+					}
+					
+					$problematicNodes = 1;
+					fisher_yates_shuffle(\@species);
+					undef @nodes2analyse;
+					undef %nodeControl;
+					@nodes2analyse = @species;
+					last;
+				} 
+			}
+		}
+		
+		my %forkResult = (
+			"tree" => \%tree_tmp,
+			"scoreMean" => $sumMean/$countAnalysed
+		);
+		
+		$pm->finish(0, \%forkResult);
+	}
+
+	$pm->wait_all_children;
+
+} while ($countTree < $replicate);
+
+
+###########################
+
+# include distance
+print " ]\nAdding distance...\n";
+my @nodes = keys %hash_tree;
+
+foreach my $node (@nodes){
+	next if (!exists $hash_tree{$node}{"score"});
+	next if (!exists $hash_tree{$node}{"child"});
+	
+	my $ancestor = $hash_tree{$node}{"parent"};
+	#next if ($ancestor eq "root");
+	my @ancChild = @{$hash_tree{$ancestor}{"child"}};
+	my $ancChild = "";
+	if ($ancChild[0] eq $node){
+		$ancChild = $ancChild[1];
+	} else {
+		$ancChild = $ancChild[0];
+	}
+	my $refAncLeaves = pickLeaves($ancChild, \%hash_tree);
+	my @ancLeaves = @$refAncLeaves;
+	
+	my @child = @{$hash_tree{$node}{"child"}};
+	
+	my $refChildLeaves1 = pickLeaves($child[0], \%hash_tree);
+	my $refChildLeaves2 = pickLeaves($child[1], \%hash_tree);
+	my @childLeaves1 = @$refChildLeaves1;
+	my @childLeaves2 = @$refChildLeaves2;
+	
+	my ($x,$y,$z) = calculateBranch(\@ancLeaves, \@childLeaves1, \@childLeaves2); #x = child1; y = child2; z = anc;
+	$hash_tree{$node}{"x"} = abs($x);
+	$hash_tree{$node}{"y"} = abs($y);
+	$hash_tree{$node}{"z"} = abs($z);
+}
+
+foreach my $node (@nodes){
+	next if (!exists $hash_tree{$node}{"child"});
+	next if (!exists $hash_tree{$node}{"score"});
+	
+	my @child = @{$hash_tree{$node}{"child"}};
+	# child1
+	my $branch = $hash_tree{$node}{"x"};
+	if (exists $hash_tree{$child[0]}{"x"}){
+		#my $mean = ($hash_tree{$child[0]}{"x"} + $hash_tree{$child[0]}{"y"})/2;
+		if ($hash_tree{$child[0]}{"x"} > $hash_tree{$child[0]}{"y"}){
+			$branch = $branch - $hash_tree{$child[0]}{"x"};
+		} else {
+			$branch = $branch - $hash_tree{$child[0]}{"y"};
+		}
+		#$branch = $branch - $mean;
+	}
+	$hash_tree{$child[0]}{"branch"} = abs($branch);
+	# child2
+	$branch = $hash_tree{$node}{"y"};
+	if (exists $hash_tree{$child[1]}{"x"}){
+		#my $mean = ($hash_tree{$child[1]}{"x"} + $hash_tree{$child[1]}{"y"})/2;
+		#$branch = $branch - $mean;
+		if ($hash_tree{$child[1]}{"x"} > $hash_tree{$child[1]}{"y"}){
+			$branch = $branch - $hash_tree{$child[1]}{"x"};
+		} else {
+			$branch = $branch - $hash_tree{$child[1]}{"y"};
+		}
+	}
+	$hash_tree{$child[1]}{"branch"} = abs($branch);
+}
+
+my @rootNode = @{$hash_tree{"root"}{"child"}};
+foreach my $rootNode(@rootNode){
+	my @rootChild = @{$hash_tree{$rootNode}{"child"}};
+	# rootChild1
+	my $branch1 = 0;
+	my $branchZ1 = 0;
+	if (exists $hash_tree{$rootChild[0]}{"x"}){
+		$branch1 = ($hash_tree{$rootChild[0]}{"x"} + $hash_tree{$rootChild[0]}{"y"})/2;
+		$branchZ1 = $hash_tree{$rootChild[0]}{"z"};
+	}
+	# rootChild2
+	my $branch2 = 0;
+	my $branchZ2 = 0;
+	if (exists $hash_tree{$rootChild[1]}{"x"}){
+		$branch2 = ($hash_tree{$rootChild[1]}{"x"} + $hash_tree{$rootChild[1]}{"y"})/2;
+		$branchZ2 = $hash_tree{$rootChild[1]}{"z"};
+	}
+	
+	my $defBranch1 = $branchZ1;
+	if ($branchZ2 != 0){
+		$defBranch1 = abs($branchZ1 - $branch2);
+	}
+	my $defBranch2 = $branchZ2;
+	if ($branchZ1 != 0){
+		$defBranch2 = abs($branchZ2 - $branch1);
+	}
+	my $defBranchMean = ($defBranch1 + $defBranch2)/2;
+	
+	my $x = ($branch2 - $branch1 + $defBranchMean)/(2*$defBranchMean);
+	$hash_tree{$rootChild[0]}{"branch"} = $defBranchMean*$x;
+	$hash_tree{$rootChild[0]}{"branch"} = 0 if ($hash_tree{$rootChild[0]}{"branch"} < 0);
+	$hash_tree{$rootChild[1]}{"branch"} = $defBranchMean*(1-$x);
+	$hash_tree{$rootChild[1]}{"branch"} = 0 if ($hash_tree{$rootChild[1]}{"branch"} < 0);
+	
+}
+
+###########################
+
+# Save tree as newick and generate itol dataset
+
+open(OUT2, "> $outfile"."_itol.txt");
+
+print OUT2 '
+DATASET_PIECHART
+#In pie chart datasets, each ID is associated to multiple numeric values, which are displayed as a pie chart directly on the node branch, or outside the tree
+#lines starting with a hash are comments and ignored during parsing
+
+#=================================================================#
+#                    MANDATORY SETTINGS                           #
+#=================================================================#
+#select the separator which is used to delimit the data below (TAB,SPACE or COMMA).This separator must be used throughout this file (except in the SEPARATOR line, which uses space).
+#SEPARATOR TAB
+#SEPARATOR SPACE
+SEPARATOR COMMA
+
+#label is used in the legend table (can be changed later)
+DATASET_LABEL,Percentage ILS
+
+#dataset color (can be changed later)
+COLOR,#ff0000
+
+#define colors for each individual field column (use hexadecimal, RGB or RGBA notation; if using RGB/RGBA, COMMA cannot be used as SEPARATOR)
+FIELD_COLORS,#0000ff,#00ff00,#ff5050
+
+#field labels
+FIELD_LABELS,1,2,3
+
+#=================================================================#
+#                    OPTIONAL SETTINGS                            #
+#=================================================================#
+
+#each dataset can have a legend, which is defined below
+#for each row in the legend, there should be one shape, color and label
+#shape should be a number between 1 and 5:
+#1: square
+#2: circle
+#3: star
+#4: right pointing triangle
+#5: left pointing triangle
+
+#LEGEND_TITLE,Dataset legend
+#LEGEND_SHAPES,1,2,3
+#LEGEND_COLORS,#ff0000,#00ff00,#0000ff
+#LEGEND_LABELS,value1,value2,value3
+
+#=================================================================#
+#     all other optional settings can be set or changed later     #
+#           in the web interface (under \'Datasets\' tab)           #
+#=================================================================#
+
+#left margin, used to increase/decrease the spacing to the next dataset. Can be negative, causing datasets to overlap. Used only for piecharts which are displayed on the outside
+#MARGIN,0
+
+#applies to external pie charts only; if set, pie charts associated to internal nodes will be displayed even if these nodes are not collapsed. It could cause overlapping in the dataset display.
+#SHOW_INTERNAL,0
+
+#maximum pie chart radius will be displayed with this size, others will be proportionally smaller. This setting applies to internal pie charts only.
+MAXIMUM_SIZE,20
+
+#pie chart height factor; For external pie charts, default radius will be slightly less than the available space between leaves, but you can set a multiplication factor here to increase/decrease it (values from 0 to 1 will decrease it, values above 1 will increase it)
+#HEIGHT_FACTOR,1
+
+#Internal tree nodes can be specified using IDs directly, or using the \'last common ancestor\' method described in iTOL help pages
+#=================================================================#
+#       Actual data follows after the "DATA" keyword              #
+#=================================================================#
+#the following fields are required for each node:
+#ID,position,radius,value1,value2,value3...
+#position defines the position of the pie chart on the tree:
+#  -1 = external pie chart
+#  a number between 0 and 1 = internal pie chart positioned at the specified value along the node branch (for example, position 0 is exactly at the start of node branch, position 0.5 is in the middle, and position 1 is at the end)
+
+DATA
+
+';
+
+@nodes2analyse = @{$hash_tree{"root"}{"child"}};
+my $tree = "<".$nodes2analyse[0].">";
+while(scalar @nodes2analyse > 0){
+	my $node = shift @nodes2analyse;
+	my $branch = "";
+	my $score = "";
+	if (exists $hash_tree{$node}{"branch"}){
+		$branch = ":".$hash_tree{$node}{"branch"};
+	}
+	if (exists $hash_tree{$node}{"scoreMean"}){
+		$score = $hash_tree{$node}{"scoreMean"};
+		my $repChild = $hash_tree{$node}{"repChild"};
+		my $sp1 = $ { $repChild }[0];
+		my $sp2 = $ { $repChild }[1];
+		my $mean = $score;
+		my $altMean = $hash_tree{$node}{"altMean"};
+		my $mean2 = $ { $altMean }[0];
+		my $mean3 = $ { $altMean }[1];
+		print OUT2 $sp1."|".$sp2.",1,15,".$mean.",".$mean2.",".$mean3."\n";
+ 
+	}
+	if (exists $hash_tree{$node}{"child"}){
+		my @children = @{$hash_tree{$node}{"child"}};
+		for (my $i = 0; $i < scalar @children; $i++){
+			push (@nodes2analyse, $children[$i]);
+		}
+		my $children = join(">,<", @children);
+		my $subs = $score.$branch;
+		$tree =~ s/<$node>/(<$children>)$subs/;
+	} else {
+		my $subs = $node.$branch;
+		$tree =~ s/<$node>/$subs/;
+	}
+}
+
+open(OUT, "> $outfile.nwk") or die;
+print OUT $tree.";\n";
+close OUT;
+close OUT2;
+
+print "Tree wrote in $outfile.nwk.\n";
+print "iToL dataset file wrote in $outfile"."_itol.nwk.\n";
+print "All done!\n";
+
+###################################
+
+sub pickLeaves {
+	my $refnode = $_[0];
+	my $treeRef = $_[1];
+	my %tree = %$treeRef;
+	my @node2analyse;
+	my @child;
+	push (@node2analyse, $refnode);
+	while (scalar @node2analyse > 0){
+		my $node = shift @node2analyse;
+		if (exists $tree{$node}{"child"}){
+			my @child = @{$tree{$node}{"child"}};
+			foreach my $child(@child){
+				push(@node2analyse, $child);
+			}
+		} else {
+			push (@child, $node);
+		}
+	}
+	return \@child;
+}
+
+sub calculateScore {
+	my $refAncLeaves = $_[0];
+	my $refChildLeaves1 = $_[1];
+	my $refChildLeaves2 = $_[2];
+	
+	my @ancLeaves = @$refAncLeaves;
+	my @childLeaves1 = @$refChildLeaves1;
+	my @childLeaves2 = @$refChildLeaves2;
+	my $sum = 0;
+	my $sum2 = 0;
+	my $sum3 = 0;
+	my $max1 = 0;
+	my $max2 = 0;
+	my $max3 = 0;
+	my $count = 0;
+	my @values;
+	for (my $i = 0; $i < scalar @ancLeaves; $i++){
+		for (my $j = 0; $j < scalar @childLeaves1; $j++){
+			for (my $k = 0; $k < scalar @childLeaves2; $k++){
+				if (exists $hash_table{$ancLeaves[$i]}{$childLeaves1[$j]}{$childLeaves2[$k]}){
+					$sum += $hash_table{$ancLeaves[$i]}{$childLeaves1[$j]}{$childLeaves2[$k]};
+					$max1 = $hash_table{$ancLeaves[$i]}{$childLeaves1[$j]}{$childLeaves2[$k]} if ($max1 < $hash_table{$ancLeaves[$i]}{$childLeaves1[$j]}{$childLeaves2[$k]});
+					$sum2 += $hash_table{$childLeaves1[$j]}{$ancLeaves[$i]}{$childLeaves2[$k]};
+					$max2 = $hash_table{$childLeaves1[$j]}{$ancLeaves[$i]}{$childLeaves2[$k]} if ($max2 < $hash_table{$childLeaves1[$j]}{$ancLeaves[$i]}{$childLeaves2[$k]});
+					$sum3 += $hash_table{$childLeaves2[$k]}{$ancLeaves[$i]}{$childLeaves1[$j]};
+					$max3 = $hash_table{$childLeaves2[$k]}{$ancLeaves[$i]}{$childLeaves1[$j]} if ($max3 < $hash_table{$childLeaves2[$k]}{$ancLeaves[$i]}{$childLeaves1[$j]});
+					push (@values, $hash_table{$ancLeaves[$i]}{$childLeaves1[$j]}{$childLeaves2[$k]});
+				} else {
+						push (@values, 0);
+				}
+				$count++;
+			}
+		}
+	}
+	my $total = $sum + $sum2 + $sum3;
+	if ($total == 0){
+		$total = 1;
+	}
+	my $mean = $sum/$total;
+	my $mean2 = $sum2/$total;
+	my $mean3 = $sum3/$total;
+	my $sumSquareDif = 0;
+	for (my $n = 0; $n < scalar @values; $n++){
+		$sumSquareDif += ($values[$n] - $mean)**2;
+	}
+	my $variance = ($sumSquareDif/$count);
+	my $result = 0;
+	my $otherNode = 0;
+	#my $meanAlt = $mean;
+	if ($mean > $mean2 && $mean > $mean3){
+	
+		#if ($max1 > $max2 && $max1 > $max2){
+			$result = 1;
+		#} else {
+		#	if ($max2 > $max3){
+		#		$otherNode = 1;
+		#	} else {
+		#		$otherNode = 2;
+		#	}
+		#}
+		
+	} else {
+		if ($mean2 > $mean3){
+			$otherNode = 1;
+			#$meanAlt = $mean2;
+		} else {
+			$otherNode = 2;
+			#$meanAlt = $mean3;
+		}
+	}
+	my @mean = ($mean, $mean2, $mean3);
+	return ($result, \@mean, $variance, $otherNode);
+}
+
+sub calculateBranch {
+	my $refAncLeaves = $_[0];
+	my $refChildLeaves1 = $_[1];
+	my $refChildLeaves2 = $_[2];
+	
+	my @ancLeaves = @$refAncLeaves;
+	my @childLeaves1 = @$refChildLeaves1;
+	my @childLeaves2 = @$refChildLeaves2;
+	
+	my $sum = 0;
+	my $count = 0;
+	my $sum2 = 0;
+	my $count2 = 0;
+	my $max1 = 0;
+	my $max2 = 0;
+	my $max3 = 0;
+	for(my $i = 0; $i < scalar @childLeaves1; $i++){
+		for(my $j = 0; $j < scalar @childLeaves2; $j++){
+			if (exists $hash_distance{$childLeaves1[$i]}{$childLeaves2[$j]}){
+				$sum += $hash_distance{$childLeaves1[$i]}{$childLeaves2[$j]};
+				if ($hash_distance{$childLeaves1[$i]}{$childLeaves2[$j]} > $max1){
+					$max1 = $hash_distance{$childLeaves1[$i]}{$childLeaves2[$j]};
+				}
+			} 
+			$count++;
+		}
+		
+		for(my $j = 0; $j < scalar @ancLeaves; $j++){
+			if (exists $hash_distance{$childLeaves1[$i]}{$ancLeaves[$j]}){
+				$sum2 += $hash_distance{$childLeaves1[$i]}{$ancLeaves[$j]};
+				if ($hash_distance{$childLeaves1[$i]}{$ancLeaves[$j]} > $max2){
+					$max2 = $hash_distance{$childLeaves1[$i]}{$ancLeaves[$j]};
+				}
+			} 
+			$count2++;
+		}
+	}
+	
+	my $sum3 = 0;
+	my $count3 = 0;
+	for(my $i = 0; $i < scalar @childLeaves2; $i++){
+		for(my $j = 0; $j < scalar @ancLeaves; $j++){
+			if (exists $hash_distance{$childLeaves2[$i]}{$ancLeaves[$j]}){
+				$sum3 += $hash_distance{$childLeaves2[$i]}{$ancLeaves[$j]};
+				if ($hash_distance{$childLeaves2[$i]}{$ancLeaves[$j]} > $max3){
+					$max3 = $hash_distance{$childLeaves2[$i]}{$ancLeaves[$j]};
+				}
+			} 
+			$count3++;
+		}
+	}
+	
+	my $mean = $sum/$count;
+	my $mean2 = $sum2/$count2;
+	my $mean3 = $sum3/$count3;
+	
+	my $z = ($max2 + $max3 - $max1)/2;
+	#my $z = ($mean2 + $mean3 - $mean)/2;
+	my $x = $max2 - $z;
+	#my $x = $mean2 - $z;
+	my $y = $max3 - $z;
+	#my $y = $mean3 - $z;
+	return ($x, $y, $z);
+}
+
+sub fisher_yates_shuffle {
+	my $deck = shift;  # $deck is a reference to an array
+	my $i = @$deck;
+	while ($i--) {
+		my $j = int rand ($i+1);
+		@$deck[$i,$j] = @$deck[$j,$i];
+	}
+}
+
+sub randomTree {
+	my $refspecies = $_[0];
+	my @species2 = @$refspecies;
+	
+	#my @firstTrio = ($species2[0],$species2[1],$species2[2]);
+	my %hash_tree2;
+
+	#$hash_tree2{$firstTrio[2]}{"parent"} = 1;
+	#$hash_tree2{$firstTrio[1]}{"parent"} = 1;
+	#$hash_tree2{$firstTrio[0]}{"parent"} = 2;
+
+	#$hash_tree2{1}{"parent"} = 2;
+	#$hash_tree2{1}{"child"} = [$firstTrio[1],$firstTrio[2]];
+
+	#$hash_tree2{2}{"parent"} = "root";
+	#$hash_tree2{2}{"child"} = [1,$firstTrio[0]];
+
+	#my $nodeNumber = 2;
+
+	#for(my $i = 3; $i < scalar @species2; $i++){
+
+		# Add species to tree;
+	#	$hash_tree2{$i}{"child"} = [$i - 1, $species2[$i]];
+	#	$hash_tree2{$i}{"parent"} = "root";
+	#	$hash_tree2{$i - 1}{"parent"} = $i;
+	#	$hash_tree2{$species2[$i]}{"parent"} = $i;
+	#	$hash_tree2{"root"}{"child"} = [$i];
+	#	$nodeNumber++;
+	#}
+
+	###
+	$hash_tree2{1}{"parent"} = "root";
+	$hash_tree2{1}{"child"} = [2,3];
+	$hash_tree2{2}{"child"} = [4,5];
+	$hash_tree2{2}{"parent"} = 1;
+	$hash_tree2{3}{"parent"} = 1;
+	$hash_tree2{4}{"parent"} = 2;
+	$hash_tree2{5}{"parent"} = 2;
+	$hash_tree2{"root"}{"child"} = [1];
+	
+	my $node = 6;
+	my %hash_noChild = (
+		3 => 1,		
+		4 => 1,		
+		5 => 1,
+	);
+	
+	for(my $i = 3; $i < scalar @species2; $i++){
+		my @noChild = keys %hash_noChild;
+		fisher_yates_shuffle(\@noChild);
+		my $random_number = int(rand(scalar @noChild)) - 1;
+		my $selectedNode = $noChild[$random_number];
+		$hash_tree2{$selectedNode}{"child"} = [$node,$node+1];
+		$hash_tree2{$node}{"parent"} = $selectedNode;
+		$hash_tree2{$node+1}{"parent"} = $selectedNode;
+		delete $hash_noChild{$selectedNode};
+		$hash_noChild{$node} = 1;
+		$hash_noChild{$node+1} = 1;
+		$node = $node+2;
+	}
+
+	my @noChildNodes = keys %hash_noChild;
+	if (scalar @noChildNodes != scalar @species2){
+		print scalar @noChildNodes." ".scalar @species2."\n";
+		die "Something wrong!\n";
+	}
+	for(my $i = 0; $i < scalar @species2; $i++){
+		my $parent = $hash_tree2{$noChildNodes[$i]}{"parent"};
+		my @parentChild = @{$hash_tree2{$parent}{"child"}};
+		my @newParentChild;
+		foreach my $parentChild(@parentChild){
+			if ($parentChild !~ /^\d+$/){
+				push(@newParentChild, $parentChild);
+				next;
+			}
+			if ($parentChild == $noChildNodes[$i]){
+				push(@newParentChild, $species2[$i]);
+				next;
+			} else {
+				push(@newParentChild, $parentChild);
+			}
+		}
+		$hash_tree2{$parent}{"child"} = [@newParentChild];
+		delete $hash_tree2{$noChildNodes[$i]};
+		$hash_tree2{$species[$i]}{"parent"} = $parent;
+	}
+	return(\%hash_tree2);
+}
+
+=head1 NAME
+
+HyperTriplets - Triplets-based supertree generator
+
+=head1 SYNOPSIS
+
+./hypertriplets_analyse -table <table_file>
+
+=item B<Other parameters>:
+
+[-tax tax_file] [-out file_name] [-rep] [-numThreads]
+		
+=item B<Help>:
+
+[-help] [-man] [-version]
+
+Use -man for a detailed help.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-table> <table_file>
+
+A table file generated by hypertriplets_db.
+
+=item B<-tax> <tax_file>
+
+A file containing the organism names that should be used to construct the tree.
+If not provided, Hypertriplets will add all organisms found in the table file 
+in the supertree. The file should have one organism per line.
+
+=item B<-out> <file_name> Default: "out"
+
+Prefix for output files.
+
+=item B<-rep> Defalut: 100
+
+Number of time that HyperTriplets should replicate the analysis to search the best tree.
+
+=item B<-numThreads> Defalut: 1
+
+Number of processors to be used for programs that can handle multi-threading.
+
+=item B<-version>
+
+Print HyperTriplets version.
+
+=item B<-help>
+
+Print a brief help message and exits.
+
+=item B<-man>
+
+Prints the manual page and exits.
+
+=back
+
+=head1 DESCRIPTION
+
+B<HyperTriplets> is a phylogenetic tool that makes a supetree based on triplets analysis. It takes as input several gene trees in Newick format. 
+
+=cut
