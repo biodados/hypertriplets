@@ -6,7 +6,9 @@ use FindBin qw($Bin);
 use lib "$Bin/lib/perl5";
 use Data::Dumper;
 use Parallel::ForkManager;
-use Storable qw(dclone store);
+use Storable qw(dclone);
+use warnings;
+no warnings 'recursion';
 
 use Getopt::Long;
 use Pod::Usage;
@@ -25,11 +27,11 @@ $| = (@ARGV > 0);
 # setup my defaults
 
 my $version;
-my $htVersion = "HyperTriplets 1.0";
+my $htVersion = "HyperTriplets 1.9";
 my $directory;
 my $help;
 my $man;
-my $outFile = "out.tab";
+my $outFile = "out";
 my $delimiter;
 my $position;
 my $numThreads	= 1;
@@ -92,7 +94,7 @@ my %meanDistance;
 my %countTotal;
 my %missingTxid;
 my $error = 0;
-
+my $maxDigit = 0;
 my $pm = Parallel::ForkManager->new($numThreads, '/tmp/');
 
 #$hashRetrieved{$file}{$treecode}{$key1} = @sister;  
@@ -127,10 +129,11 @@ $pm -> run_on_finish ( # called BEFORE the first call to start()
 					
 					foreach my $groupid2 (keys %{$hash_confirm2{$groupid}}){
 						$countSis2{$groupid}{$groupid2} += $hash_confirm2{$groupid}{$groupid2}/$sum;
+						$maxDigit = $countSis2{$groupid}{$groupid2} if ($countSis2{$groupid}{$groupid2} > $maxDigit);
 					}
 				}
 				
-				my @genera2 = keys %genera;
+				my @genera2 = sort keys %genera;
 				for (my $k = 0; $k < scalar(@genera2); $k++){
 					$genera3{$genera2[$k]} = 1;
 					for (my $l = $k+1; $l < scalar(@genera2); $l++){
@@ -139,11 +142,7 @@ $pm -> run_on_finish ( # called BEFORE the first call to start()
 							$meanDistance{$genera2[$k]}{$genera2[$l]}{"sum"} += $mean;
 							$meanDistance{$genera2[$k]}{$genera2[$l]}{"count"} += 1;
 							$meanDistance{$genera2[$k]}{$genera2[$l]}{"value"} .= $mean.";";
-							$meanDistance{$genera2[$l]}{$genera2[$k]}{"sum"} += $mean;
-							$meanDistance{$genera2[$l]}{$genera2[$k]}{"count"} += 1;
-							$meanDistance{$genera2[$l]}{$genera2[$k]}{"value"} .= $mean.";";
 						}
-						
 					}
 				}
 				########
@@ -197,9 +196,9 @@ foreach my $file (@listFile){
 			#if (scalar(keys %countSis) < 3){
 			#	next;
 			#} else {
-				$hash_result{"tree"}{"tree".$treeCount}{"sister"} = $refCountSis;
+				$hash_result{"tree"}{"sister"} = $refCountSis;
 				my $refDist = &pickDist($refTree, $refTax, $refDupNodes);
-				$hash_result{"tree"}{"tree".$treeCount}{"distance"} = $refDist;
+				$hash_result{"tree"}{"distance"} = $refDist;
 				$treeCount++;
 			#}
 			
@@ -210,46 +209,48 @@ foreach my $file (@listFile){
 		my %hash_confirm2;
 		my %meanDistance2;
 		my %genera;
-		foreach my $tree(keys %{$hash_result{"tree"}}){
+		#foreach my $tree(keys %{$hash_result{"tree"}}){
 		
 			# count sister
-			my %hash_species;
-			my %hash_confirm;
-			undef %hash_confirm;
+			#my %hash_species;
+			#my %hash_confirm;
+			#undef %hash_confirm;
 			#my @allSpecies = keys %{$hashRetrieved{$file}{$tree}{"sister"}};
 			#%hash_species = map { $_ => 1 } @allSpecies;
-			my $ref_sister = $hash_result{"tree"}{$tree}{"sister"};
-			my %hash_sister = %$ref_sister; 
-			foreach my $id (keys %hash_sister){
-				foreach my $id2(keys %{$hash_sister{$id}}){
-					if (exists $hash_confirm{$id2}){
-							next;
-					} else {
-						$hash_confirm{$id2} = 1;
-						$hash_confirm2{$id}{$id2} += 1;
-					}
-				}
-			}
+			#my $ref_sister = $hash_result{"tree"}{$tree}{"sister"};
+			#my %hash_sister = %$ref_sister; 
+			#foreach my $id (keys %hash_sister){
+			#	foreach my $id2(keys %{$hash_sister{$id}}){
+			#		if (exists $hash_confirm{$id2}){
+			#				next;
+			#		} else {
+			#			$hash_confirm{$id2} = 1;
+			#			$hash_confirm2{$id}{$id2} += 1;
+			#		}
+			#	}
+			#}
 			
 			# count distance
-			my @distances = @{$hash_result{"tree"}{$tree}{"distance"}{"matrix"}};
-			my @genera = @{$hash_result{"tree"}{$tree}{"distance"}{"leaf"}};
-			
+			my @distances = @{$hash_result{"tree"}{"distance"}{"matrix"}};
+			my @genera = @{$hash_result{"tree"}{"distance"}{"leaf"}};
 			for(my $i = 0; $i < scalar @genera; $i++){
 				$genera{$genera[$i]} = 1;
 				for(my $j = $i + 1; $j < scalar @genera; $j++){
 					next if (!$distances[$i][$j]);
 					my $distance = $distances[$i][$j];
-					$meanDistance2{$genera[$i]}{$genera[$j]}{"sum"} += $distance;
-					$meanDistance2{$genera[$i]}{$genera[$j]}{"count"} += 1;
-					$meanDistance2{$genera[$j]}{$genera[$i]}{"sum"} += $distance;
-					$meanDistance2{$genera[$j]}{$genera[$i]}{"count"} += 1;
+					if ($genera[$i] lt $genera[$j]){
+						$meanDistance2{$genera[$i]}{$genera[$j]}{"sum"} += $distance;
+						$meanDistance2{$genera[$i]}{$genera[$j]}{"count"} += 1;
+					} else {
+						$meanDistance2{$genera[$j]}{$genera[$i]}{"sum"} += $distance;
+						$meanDistance2{$genera[$j]}{$genera[$i]}{"count"} += 1;
+					}
 				}
 			}
 			
-		}
+		#}
 		$hash_result2{"meanDistance"} = \%meanDistance2;
-		$hash_result2{"sister"} = \%hash_confirm2;
+		$hash_result2{"sister"} = $hash_result{"tree"}{"sister"};
 		$hash_result2{"genera"} = \%genera;
 		################
 	}
@@ -263,35 +264,76 @@ foreach my $file (@listFile){
 $pm->wait_all_children;
 
 # store
-#store \%countSis2, $outFile.".".$outFileCount;
+print "storing data...\n";
+#my %hashAll = (
+#	"sister" => \%countSis2,
+#	"distance" => \%meanDistance,
+#);
+#store \%countSis2, $outFile."_sis.hash";
+#store \%meanDistance, $outFile."_dis.hash";
 
-open (OUT, "> $outFile") or die;
+#exit;
+
+$maxDigit = length(sprintf("%.2f",$maxDigit));
+my @genera3 = sort keys %genera3;
+my %mapGenera;
+my $digitGenera = length(scalar @genera3);
+
+for(my $i = 0; $i < scalar @genera3; $i++){
+	$mapGenera{$genera3[$i]} = sprintf("%0".$digitGenera."d", $i);
+}
+my $digitTriplets = ($maxDigit*3)+($digitGenera*3)+6;
+open (OUT, "> $outFile.dat") or die;
+print OUT "OTU|".join(";", @genera3)."\n";
+print OUT "digitTriplets|".$digitTriplets."\n";
+close OUT;
 
 # print sister table
-print OUT "#spA,spB,spC\tspA|spB,spC\tspB|spA,spC\tspC|spA,spB\n";
-foreach my $id (sort keys %countSis2){
-	my @ids = split(",", $id);
-	print OUT $id;
-	for (my $i = 0; $i < 3; $i++){
-		my @ids2 = @ids;
-		my $ancestor = $ids2[$i];
-		splice @ids2, $i, 1;
-		push(@ids2, $ancestor);
-		my $id2 = join(",", @ids2);
-		
-		if (exists $countSis2{$id}{$id2}){
-			print OUT "\t".$countSis2{$id}{$id2};
-		} else {
-			print OUT "\t0";
+open (OUT, "> $outFile.tri") or die;
+#print OUT "#spA,spB,spC\tspA|spB,spC\tspB|spA,spC\tspC|spA,spB\n";
+
+for(my $i = 0; $i < scalar @genera3 - 2; $i++){
+	for(my $j = $i + 1; $j < scalar @genera3 - 1; $j++){
+		for(my $k = $j + 1; $k < scalar @genera3; $k++){
+			my @ids = ($genera3[$i],$genera3[$j],$genera3[$k]);
+			my $id = join(",", @ids);
+			for(my $i = 0; $i < 3; $i++){
+				print OUT $mapGenera{$ids[$i]};
+				print OUT ";" if ($i < 2);
+			}
+			print OUT "|";
+			if (exists $countSis2{$id}){
+				for(my $i = 0; $i < 3; $i++){
+					my @ids2 = @ids;
+					my $ancestor = $ids2[$i];
+					splice @ids2, $i, 1;
+					push(@ids2, $ancestor);
+					my $id2 = join(",", @ids2);
+					
+					if (exists $countSis2{$id}{$id2}){
+						my $value = sprintf("%0".$maxDigit.".2f", $countSis2{$id}{$id2});
+						print OUT $value;
+						#print OUT "\t".$countSis2{$id}{$id2};
+					} else {
+						my $valueLeft = sprintf("%0".$maxDigit.".2f", 0);
+						print OUT $valueLeft
+						#print OUT "\t0";
+					}
+					print OUT ";" if ($i < 2);
+				}
+				print OUT "\n";
+			} else {
+				print OUT sprintf("%0".$maxDigit.".2f", 0).";".sprintf("%0".$maxDigit.".2f", 0).";".sprintf("%0".$maxDigit.".2f", 0)."\n";
+			}
 		}
 	}
-	print OUT "\n";
 }
+close OUT;
 
 # print distance table
+open (OUT, "> $outFile.dis") or die;
+print OUT "# sp1\tsp2\tmean\tsum\tcount\tmedian\tstd\n";
 
-print OUT "\n# sp1\tsp2\tmean\tsum\tcount\tmedian\tstd\n";
-my @genera3 = sort keys %genera3;
 for(my $i = 0; $i < scalar @genera3; $i++){
 	for(my $j = $i + 1; $j < scalar @genera3; $j++){
 		my $mean;
@@ -303,7 +345,7 @@ for(my $i = 0; $i < scalar @genera3; $i++){
 			#$median = 0;
 		} else {
 			$mean = $meanDistance{$genera3[$i]}{$genera3[$j]}{"sum"}/$meanDistance{$genera3[$i]}{$genera3[$j]}{"count"};
-			my $values = $meanDistance{$genera3[$j]}{$genera3[$i]}{"value"};
+			my $values = $meanDistance{$genera3[$i]}{$genera3[$j]}{"value"};
 			chop $values;
 			my @values = split(";", $values); 
 			@values = sort { $a <=> $b } @values;
@@ -319,13 +361,16 @@ for(my $i = 0; $i < scalar @genera3; $i++){
 			}
 			my $variance = $sumdiffsquare/(scalar @values);
 			my $std = $variance**0.5;
-			print OUT $genera3[$i]."\t".$genera3[$j]."\t".$mean."\t".$meanDistance{$genera3[$i]}{$genera3[$j]}{"sum"}."\t".$meanDistance{$genera3[$i]}{$genera3[$j]}{"count"}."\t".$median."\t".$std."\n";
-			print OUT $genera3[$j]."\t".$genera3[$i]."\t".$mean."\t".$meanDistance{$genera3[$j]}{$genera3[$i]}{"sum"}."\t".$meanDistance{$genera3[$j]}{$genera3[$i]}{"count"}."\t".$median."\t".$std."\n";
+			print OUT $mapGenera{$genera3[$i]}."\t".$mapGenera{$genera3[$j]}."\t";
+			print OUT sprintf("%.3f", $mean)."\t".sprintf("%.3f", $meanDistance{$genera3[$i]}{$genera3[$j]}{"sum"})."\t".$meanDistance{$genera3[$i]}{$genera3[$j]}{"count"}."\t".sprintf("%.3f", $median)."\t".sprintf("%.3f", $std)."\n";
+			#print OUT $genera3[$j]."\t".$genera3[$i]."\t".$mean."\t".$meanDistance{$genera3[$j]}{$genera3[$i]}{"sum"}."\t".$meanDistance{$genera3[$j]}{$genera3[$i]}{"count"}."\t".$median."\t".$std."\n";
 		}
 	}
 }
 
-print "\nThe file $outFile was generated.\n";
+close OUT;
+
+print "The files $outFile\[.dat, .dis, .tri\] were created.\n";
 print "Execute the command \"./hypertriplets_analyse -table $outFile\" to generate the supertree.\n";
 print "All Done!\n\n";
 
