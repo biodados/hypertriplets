@@ -29,13 +29,13 @@
 ## Installation:
 
 	HyperTriplets is ready to use  in  most  of  Unix  Platform.  But  it  only 
-	works if the  folders  lib/  that follow this script are  in  the  same 
+	works if the  folder  lib/  that follow this script is  in  the  same 
 	location. If you want to freely run HyperTriplets  in  other  location, add  
 	the HyperTriplets folder  into  the  environment  variable  by  using,  for 
 	example, the following commands:
 	
-	> echo "export PATH=$PATH:/path/to/program/hypertriplets/" >> ~/.bash_profile
-	> source ~/.bash_profile
+	> echo "export PATH=$PATH:/path/to/program/hypertriplets/" >> ~/.bashrc
+	> source ~/.bashrc
 
 	
 ## Running with sample files:
@@ -47,9 +47,9 @@
 
 ## Outputs:
 
-	eldograph_db: a hash file containing the taxonomic and distance information.
+	hypertriplets_db: a hash file containing the taxonomic and distance information.
 	
-	eldograph_analyse:
+	hypertriplets_analyse:
       *.nwk:        a supertree in Newick format.
       *_itol.txt:   a file containing a pie chart dataset with branch support values.
                     Upload the supertree and this file to iToL.
